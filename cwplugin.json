@@ -1,7 +1,7 @@
 {
   "id": "com.weather",
   "name": "天气",
-  "version": "1.0.0",
+  "version": "v1.0.3",
   "api_version": "~=0.4.2",
   "entry": "main.py",
   "author": "松峰",
