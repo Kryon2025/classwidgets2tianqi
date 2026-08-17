@@ -15,10 +15,15 @@ SettingsLayout {
     property int intervalValue: 30
     onIntervalValueChanged: settings.refresh_interval = intervalValue
 
+    // 预警播报时长当前值（秒），始终与显示同步
+    property int alertTimeValue: 5
+    onAlertTimeValueChanged: settings.alert_show_time = alertTimeValue
+
     // 一次性读取持久化设置（旧实例可能缺少新键，缺省回退默认值）
     Component.onCompleted: {
         intervalValue = settings.refresh_interval !== undefined ? settings.refresh_interval : 30
         cityText = settings.city !== undefined ? settings.city : ""
+        alertTimeValue = settings.alert_show_time !== undefined ? settings.alert_show_time : 5
     }
 
     SettingCard {
@@ -67,6 +72,31 @@ SettingsLayout {
         Switch {
             checked: settings.show_alerts
             onCheckedChanged: settings.show_alerts = checked
+        }
+    }
+
+    SettingCard {
+        Layout.fillWidth: true
+        title: "预警播报时长"
+        description: "预警弹出并滚动播报几秒后自动收起（秒），点击加减按钮以 1 调整。"
+
+        RowLayout {
+            spacing: 8
+            Button {
+                text: "−"
+                implicitWidth: 36
+                onClicked: alertTimeValue = Math.max(1, alertTimeValue - 1)
+            }
+            Text {
+                Layout.preferredWidth: 80
+                horizontalAlignment: Text.AlignHCenter
+                text: alertTimeValue + " 秒"
+            }
+            Button {
+                text: "+"
+                implicitWidth: 36
+                onClicked: alertTimeValue = Math.min(60, alertTimeValue + 1)
+            }
         }
     }
 }

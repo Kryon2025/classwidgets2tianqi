@@ -1,9 +1,12 @@
 """
 天气
-Class Widgets 2 天气插件：实时天气与气象局预警（数据来自中央气象台 NMC，无需 API Key）。
+Class Widgets 2 天气插件：实时天气与气象局预警（数据来自中央气象台 NMC + 中国天气网双源交叉校验，无需 API Key）。
 """
 
+import datetime as dt
 import json
+import re
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -19,6 +22,13 @@ HEADERS = {
         "Chrome/91.0.4472.124 Safari/537.36"
     )
 }
+CN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "http://www.weather.com.cn/",
+}
 # 预警级别优先级（值越小越严重）
 LEVEL_PRIORITY = {"红": 0, "橙": 1, "黄": 2, "蓝": 3, "白": 4}
 SUFFIXES = ("特别行政区", "自治区", "自治州", "自治县", "自治旗", "地区", "盟", "市", "区", "县", "省")
@@ -28,6 +38,13 @@ def _get_json(url, timeout=15):
     req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _get_text(url, timeout=10):
+    """拉取原始文本（中国天气网接口返回 JS 变量而非纯 JSON）。"""
+    req = urllib.request.Request(url, headers=CN_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 def _norm(name):
@@ -123,52 +140,245 @@ def fetch_alerts(province, city):
     return result[:3]
 
 
+# ── 中国天气网（weather.com.cn）补充源 ──────────────────────────────
+
+_CN_CODE_CACHE: dict = {}
+
+
+def _get_cn_code(city_name):
+    """城市名 → 中国天气网城市 code（toy1 搜索，内存缓存）。"""
+    if city_name in _CN_CODE_CACHE:
+        return _CN_CODE_CACHE[city_name]
+    try:
+        url = f"http://toy1.weather.com.cn/search?cityname={urllib.parse.quote(city_name)}"
+        text = _get_text(url, timeout=8)
+        refs = re.findall(r'"ref":"(\d+)~([^~]*)~([^~]*)~', text)
+        code = None
+        for cid, pinyin, cn_name in refs:
+            if cn_name == city_name:  # 精确匹配中文名
+                code = cid
+                break
+        if code is None and refs:
+            code = refs[0][0]
+        _CN_CODE_CACHE[city_name] = code
+        return code
+    except Exception as e:
+        print(f"[weather] 中国天气网城市解析失败: {e}")
+        return None
+
+
+def _fetch_cn_weather(city_name):
+    """中国天气网：实时温度/湿度/风力/天气 + 当日最低温。失败返回 None。"""
+    code = _get_cn_code(city_name)
+    if not code:
+        return None
+    text = _get_text(
+        f"http://d1.weather.com.cn/weather_index/{code}.html?_={int(time.time() * 1000)}",
+        timeout=8)
+    sk = {}
+    dz = {}
+    m = re.search(r"var dataSK\s*=\s*(\{.*?\});", text, re.S)
+    if m:
+        try:
+            sk = json.loads(m.group(1))
+        except Exception:
+            sk = {}
+    m2 = re.search(r"var cityDZ\s*=\s*(\{.*?\});", text, re.S)
+    if m2:
+        try:
+            dz = json.loads(m2.group(1))
+        except Exception:
+            dz = {}
+    dz_info = dz.get("weatherinfo") or {}
+    if not sk and not dz_info:
+        return None
+    return {
+        "temp": sk.get("temp") if sk else None,
+        "humidity": (sk.get("SD") or "").rstrip("%") if sk else None,
+        "wind": f"{sk.get('WD') or ''} {sk.get('WS') or ''}".strip() if sk else "",
+        "info": sk.get("weather") if sk else None,
+        "low": dz_info.get("tempn"),
+    }
+
+
+# ── 数据校验（确保每个显示字段正常）──────────────────────────────
+
+def _valid_temp(value):
+    """温度合理性校验：过滤哨兵（999/9999）与物理范围外（±60°C）的值。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(f) >= 999 or f < -60 or f > 60:
+        return None
+    return f
+
+
+def _valid_humidity(value):
+    """湿度合理性校验：0~100%。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f < 0 or f > 100:
+        return None
+    return f
+
+
+# ── 双源融合 ─────────────────────────────────────────────────
+
 def fetch_weather(city_name, index):
-    """解析城市并抓取天气与预警"""
+    """双源拉取并融合：NMC（主，含体感与预警）+ 中国天气网（校验/兜底）。
+
+    返回统一结构，所有显示字段均经过哨兵过滤与合理性校验。
+    """
+    nmc = _parse_nmc(city_name, index)
+    cn = None
+    try:
+        cn = _fetch_cn_weather(city_name)
+    except Exception as e:
+        print(f"[weather] 中国天气网获取失败: {e}")
+    if nmc is None and cn is None:
+        raise ValueError(f"未找到城市：{city_name}")
+    return _merge_weather(nmc, cn, city_name)
+
+
+def _parse_nmc(city_name, index):
+    """NMC 数据源解析（含 9999 哨兵与华氏异常处理），失败返回 None。"""
     entry = resolve_city(index, city_name)
     if not entry:
-        raise ValueError(f"未找到城市：{city_name}")
-    data = _get_json(f"{BASE}/weather?stationid={entry['code']}")
-    payload = data.get("data") or {}
-    real = payload.get("real") or {}
-    predict = payload.get("predict") or {}
-    station = real.get("station") or {}
-    w = real.get("weather") or {}
-    wind = real.get("wind") or {}
-    detail = predict.get("detail") or []
-    today = detail[0] if detail else {}
-    day = (today.get("day") or {}).get("weather") or {}
-    night = (today.get("night") or {}).get("weather") or {}
+        return None
+    try:
+        data = _get_json(f"{BASE}/weather?stationid={entry['code']}")
+        payload = data.get("data") or {}
+        real = payload.get("real") or {}
+        predict = payload.get("predict") or {}
+        station = real.get("station") or {}
+        w = real.get("weather") or {}
+        wind = real.get("wind") or {}
+        detail = predict.get("detail") or []
+        today = detail[0] if detail else {}
+        day = (today.get("day") or {}).get("weather") or {}
+        night = (today.get("night") or {}).get("weather") or {}
 
-    def _num(value):
-        try:
-            return str(round(float(value)))
-        except (TypeError, ValueError):
-            return "--"
+        def _num(value):
+            f = _valid_temp(value)
+            return str(round(f)) if f is not None else "--"
 
-    # 过滤接口哨兵值 9999（无数据）
-    direct = wind.get("direct") or ""
-    if direct == "9999":
-        direct = ""
-    power = wind.get("power") or ""
-    if power == "9999":
-        power = ""
-    humidity = w.get("humidity") or "--"
-    if humidity not in ("--", "9999"):
-        humidity = _num(humidity)
+        # 过滤接口哨兵值 9999（无数据）
+        direct = wind.get("direct") or ""
+        if direct == "9999":
+            direct = ""
+        power = wind.get("power") or ""
+        if power == "9999":
+            power = ""
+
+        # 体感温度：哨兵/缺失不显示；与当前温度相差过大时疑似华氏度或异常值，尝试转换
+        feel = ""
+        feel_raw = w.get("feelst")
+        if feel_raw not in (None, ""):
+            feel_f = _num(feel_raw)
+            if feel_f != "--":
+                temp_raw = w.get("temperature")
+                if temp_raw not in (None, ""):
+                    t = _valid_temp(temp_raw)
+                    if t is not None and abs(float(feel_raw) - t) > 20:
+                        celsius = (float(feel_raw) - 32) * 5 / 9
+                        feel_f = str(round(celsius)) if abs(celsius - t) <= 20 else ""
+                feel = feel_f
+
+        humidity = w.get("humidity") or "--"
+        if humidity not in ("--", "9999"):
+            humidity = _num(humidity)
+
+        # 最高气温：当天白天预报未发布/已归档（NMC 夜间返回 9999）时，
+        # 用当前实时温度兜底，避免显示 9999 或空值
+        hi = _num(day.get("temperature"))
+        hi_forecast = hi != "--"
+        if not hi_forecast:
+            hi = _num(w.get("temperature"))
+            if hi == "--":
+                hi = _num(night.get("temperature"))
+
+        return {
+            "city": station.get("city") or entry["city"],
+            "province": station.get("province") or entry["province"],
+            "temp": _num(w.get("temperature")),
+            "info": w.get("info") or "--",
+            "wind": f"{direct} {power}".strip() or "--",
+            "hi": hi,
+            "hi_forecast": hi_forecast,
+            "lo": _num(night.get("temperature")),
+            "feel": feel,
+            "humidity": humidity,
+            "alerts": fetch_alerts(entry["province"], entry["city"]),
+            "publish_time": real.get("publish_time") or "",
+        }
+    except Exception as e:
+        print(f"[weather] NMC 获取失败: {e}")
+        return None
+
+
+def _merge_weather(nmc, cn, city_name):
+    """融合双源数据并做合理性校验，保证每个显示字段正常。"""
+    nmc = nmc or {}
+    cn = cn or {}
+
+    def tstr(v):
+        f = _valid_temp(v)
+        return str(round(f)) if f is not None else None
+
+    def hstr(v):
+        f = _valid_humidity(v)
+        return str(round(f)) if f is not None else None
+
+    # 实时温度：NMC 优先，中国天气网兜底；差异 >8° 视为数据冲突，以 NMC 为准
+    t_nmc = tstr(nmc.get("temp"))
+    t_cn = tstr(cn.get("temp"))
+    if t_nmc and t_cn and abs(float(t_nmc) - float(t_cn)) > 8:
+        print(f"[weather] 实时温度双源差异过大: NMC {t_nmc}° vs 中国天气网 {t_cn}°，以 NMC 为准")
+    temp = t_nmc or t_cn
+
+    info = (nmc.get("info") or cn.get("info")) or "--"
+    wind = (nmc.get("wind") or cn.get("wind")) or "--"
+    humidity = hstr(nmc.get("humidity")) if nmc.get("humidity") not in (None, "--") else None
+    if not humidity and cn.get("humidity") not in (None, ""):
+        humidity = hstr(cn.get("humidity"))
+    humidity = humidity or "--"
+
+    # 体感（NMC 独有）：无效则留空（QML 不渲染）
+    feel = nmc.get("feel") or ""
+    f = tstr(feel)
+    if not f:
+        feel = ""
+    elif temp and temp != "--" and abs(float(f) - float(temp)) > 20:
+        feel = ""
+
+    # 最高/最低：预报优先，中国天气网补最低，保证 hi >= lo
+    hi = tstr(nmc.get("hi"))
+    hi_forecast = bool(hi) and bool(nmc.get("hi_forecast"))
+    lo = tstr(nmc.get("lo"))
+    if not lo:
+        lo = tstr(cn.get("low"))
+    if not hi and temp and temp != "--":
+        hi = temp
+    if hi and lo and float(hi) < float(lo):
+        hi = lo
+        hi_forecast = False  # 用最低值抬升过，不再视为可靠预报
 
     return {
-        "city": station.get("city") or entry["city"],
-        "province": station.get("province") or entry["province"],
-        "temp": _num(w.get("temperature")),
-        "info": w.get("info") or "--",
-        "wind": f"{direct} {power}".strip() or "--",
-        "hi": str(day.get("temperature") or "--"),
-        "lo": str(night.get("temperature") or "--"),
-        "feel": _num(w.get("feelst")) if w.get("feelst") not in (None, "") else "",
+        "city": nmc.get("city") or city_name,
+        "province": nmc.get("province") or "",
+        "temp": temp or "--",
+        "info": info,
+        "wind": wind,
+        "hi": hi or "--",
+        "hi_forecast": hi_forecast,
+        "lo": lo or "--",
+        "feel": feel,
         "humidity": humidity,
-        "alerts": fetch_alerts(entry["province"], entry["city"]),
-        "publish_time": real.get("publish_time") or "",
+        "alerts": nmc.get("alerts") or [],
+        "publish_time": nmc.get("publish_time") or "",
     }
 
 
@@ -283,6 +493,16 @@ class Plugin(CW2Plugin):
         self._worker.start()
 
     def _on_ok(self, data):
+        # 当天最高温：白天拿到真实预报时缓存；夜间预报归档（回退值）时复用缓存
+        today = dt.date.today().isoformat()
+        if data.get("hi_forecast") and data["hi"] != "--":
+            self._today_hi = data["hi"]
+            self._today_hi_date = today
+        elif self._today_hi_date == today and self._today_hi:
+            try:
+                data["hi"] = str(max(int(data["hi"]), int(self._today_hi)))
+            except ValueError:
+                data["hi"] = self._today_hi
         self._city = data["city"]
         self._temp = data["temp"]
         self._info = data["info"]
@@ -308,7 +528,7 @@ class Plugin(CW2Plugin):
     def on_load(self):
         super().on_load()
         self.api.widgets.register(
-            widget_id="com.laoshuikaixue.weather",
+            widget_id="com.kryon.weather",
             name="天气",
             qml_path="qml/weather.qml",
             backend_obj=self,
@@ -317,6 +537,7 @@ class Plugin(CW2Plugin):
                 "city": "",          # 城市名（如：北京 / 成都）
                 "refresh_interval": 30,  # 自动刷新间隔（分钟）
                 "show_alerts": True,     # 显示气象预警
+                "alert_show_time": 5,    # 预警播报时长（秒），到时自动收起
             },
         )
         print("[weather] 插件已加载")
