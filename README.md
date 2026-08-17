@@ -1,6 +1,6 @@
 # 天气（Class Widgets 2）
 
-一个展示实时天气与气象局预警的 Class Widgets 2 插件，数据来自中央气象台（NMC，www.nmc.cn），无需任何 API Key。
+一个展示实时天气与气象局预警的 Class Widgets 2 插件，数据来自中央气象台（NMC，www.nmc.cn），无需任何 API Key。由Deepseek辅助开发
 
 ## 功能
 
@@ -13,10 +13,3 @@
 
 - 城市首次解析需要下载省市站列表（约 30 个请求，几秒），完成后缓存在插件目录 `.station_index.json`
 - 数据接口为中央气象台公开 REST 接口，非官方 SDK，如接口变动请反馈
-
-## 开发
-
-```
-pip install class-widgets-sdk
-cw-plugin-pack
-```
