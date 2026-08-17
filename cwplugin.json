@@ -1,0 +1,11 @@
+{
+  "id": "com.laoshuikaixue.weather",
+  "name": "天气",
+  "version": "1.0.0",
+  "api_version": "~=0.4.2",
+  "entry": "main.py",
+  "author": "LaoShui",
+  "description": "实时天气与气象局预警（数据来自中央气象台 NMC）。",
+  "readme": "README.md",
+  "icon": "icon.png"
+}
