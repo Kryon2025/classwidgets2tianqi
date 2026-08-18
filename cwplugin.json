@@ -1,11 +1,11 @@
 {
  "id": "com.weather",
  "name": "天气",
- "version": "v1.0.4",
+ "version": "v1.0.5",
  "api_version": "~=0.6.0",
  "entry": "main.py",
  "author": "松峰",
- "description": "实时天气与气象局预警（数据来自中央气象台 NMC）。",
+ "description": "实时天气与气象局预警(数据来自中央气象台 NMC)。",
  "url": "https://github.com/Kryon2025/classwidgets2tianqi.git",
  "readme": "README.md",
  "icon": "icon.png"
