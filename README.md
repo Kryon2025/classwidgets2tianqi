@@ -16,3 +16,7 @@
 
 ##问题
 - 已发现在晚上时无法正常获取当日最高温，原因为未调用api，使用免费接口。若当日白天已获取到当日最高温度，理论上缓存将会保存此数据，当日晚上再查看时将会正常显示
+## SDK 版本
+
+本插件已升级适配 Class Widgets 2 SDK **0.6.0**（`cwplugin.json` 中 `api_version: ~=0.6.0`），
+使用官方 `ClassWidgets.SDK` 接口（`CW2Plugin` / `PluginAPI`：`api.widgets` / `api.ui` / `api.notification` / `api.schedule` / `api.config` / `api.runtime` 等）。
