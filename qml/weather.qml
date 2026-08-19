@@ -16,6 +16,13 @@ Widget {
     property string currentCity: settings.city
     onCurrentCityChanged: backend.refresh(currentCity)
 
+    // 自动定位开关来自组件配置（组件设置页只写 settings，无 backend）；
+    // 组件作为桥梁把配置同步给后端，配置更新（点确定保存）时自动生效
+    property bool autoLocationValue: settings.auto_location !== undefined ? settings.auto_location : true
+    onAutoLocationValueChanged: {
+        if (backend) backend.setAutoLocation(autoLocationValue)
+    }
+
     // 预警级别颜色（红/橙/黄/蓝）
     property color levelColor: backend.alertLevel === "红" ? "#E64340" :
                                backend.alertLevel === "橙" ? "#F59A23" :
@@ -272,6 +279,15 @@ Widget {
         }
     }
 
+    // 后端配置变化（如自动定位开关切换）后立即按当前城市刷新，
+    // 不依赖 30 分钟定时器；与测试插件组件同款监听
+    Connections {
+        target: backend
+        function onConfigChanged() {
+            backend.refresh(currentCity)
+        }
+    }
+
     // 自动刷新定时器
     Timer {
         id: refreshTimer
@@ -281,5 +297,8 @@ Widget {
         onTriggered: backend.refresh(currentCity)
     }
 
-    Component.onCompleted: backend.refresh(currentCity)
+    Component.onCompleted: {
+        if (backend) backend.setAutoLocation(autoLocationValue)
+        backend.refresh(currentCity)
+    }
 }

@@ -1,9 +1,10 @@
-# 天气（Class Widgets 2）
+# 天气(NMC)
 
-一个展示实时天气与气象局预警的 Class Widgets 2 插件，数据来自中央气象台（NMC，www.nmc.cn），无需任何 API Key。由Deepseek辅助开发。
+一个展示实时天气与气象局预警的 Class Widgets 2 插件，数据来自中央气象台（NMC，www.nmc.cn），无需任何 API Key。由Deepseek V4 Flash开发。
 
 ## 功能
 
+- 自动根据IP获取位置信息，若位置不准确可在小组件编辑界面手动更改
 - 实时温度、天气现象、风力（中央气象台实况）
 - 今日最高 / 最低温（中央气象台 7 天预报）
 - 气象局预警：按省份拉取预警列表并匹配所在城市，显示最新且最严重的预警（红/橙/黄/蓝分级配色），最多 3 条
@@ -16,7 +17,7 @@
 
 ##问题
 - 已发现在晚上时无法正常获取当日最高温，原因为未调用api，使用免费接口。若当日白天已获取到当日最高温度，理论上缓存将会保存此数据，当日晚上再查看时将会正常显示
+
 ## SDK 版本
 
-本插件已升级适配 Class Widgets 2 SDK **0.6.0**（`cwplugin.json` 中 `api_version: ~=0.6.0`），
-使用官方 `ClassWidgets.SDK` 接口（`CW2Plugin` / `PluginAPI`：`api.widgets` / `api.ui` / `api.notification` / `api.schedule` / `api.config` / `api.runtime` 等）。
+本插件已升级适配 Class Widgets 2 SDK **0.6.0**

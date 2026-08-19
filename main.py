@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ClassWidgets.SDK import CW2Plugin, PluginAPI
+from loguru import logger
 from PySide6.QtCore import QThread, Signal, Property, Slot
 
 BASE = "https://www.nmc.cn/rest"
@@ -47,6 +48,31 @@ def _get_text(url, timeout=10):
         return resp.read().decode("utf-8", errors="replace")
 
 
+# ── IP 定位（自动获取当前位置）──────────────────────
+IP_LOCATE_URLS = (
+    "http://ip-api.com/json/?lang=zh-CN",
+    "http://ip.useragentinfo.com/json",
+)
+
+
+def locate_city_by_ip():
+    """通过公网 IP 定位当前城市，返回城市名（市级）或 None。
+
+    城市名优先取市级（ip-api 的 city / useragentinfo 的 province），
+    供 NMC / 中国天气网等按城市名索引的源解析站点。
+    """
+    for url in IP_LOCATE_URLS:
+        try:
+            d = _get_json(url, timeout=8)
+            if d.get("status") == "success":          # ip-api.com
+                return d.get("city") or d.get("regionName") or None
+            if d.get("success") and d.get("lat"):     # ip.useragentinfo.com
+                return d.get("province") or d.get("city") or None
+        except Exception:
+            continue
+    return None
+
+
 def _norm(name):
     """去掉行政区后缀，便于名称匹配"""
     for suf in SUFFIXES:
@@ -72,10 +98,17 @@ def build_city_index():
 
 
 def _load_index_cached(path):
-    """读取缓存索引，没有则构建并落盘"""
+    """读取缓存索引，没有则构建并落盘。
+
+    旧版索引的 station code 是数字（如 58362），2026 年 NMC 接口改版后
+    数字 code 一律返回空数据，因此检测到旧格式时强制重建（新格式为字母 code）。
+    """
     try:
         if path.exists():
             index = json.loads(path.read_text(encoding="utf-8"))
+            if index and re.match(r"^\d+$", str(index[0].get("code", ""))):
+                print("[weather] 检测到旧版数字 station code 索引，触发重建")
+                index = None
             if index:
                 return index
     except Exception:
@@ -250,7 +283,11 @@ def _parse_nmc(city_name, index):
         return None
     try:
         data = _get_json(f"{BASE}/weather?stationid={entry['code']}")
-        payload = data.get("data") or {}
+        payload = data.get("data")
+        # NMC 改版后旧数字 code 返回空 data：视为本数据源失败，交给中国天气网兜底
+        if not payload:
+            print(f"[weather] NMC 对 stationid={entry['code']} 返回空数据")
+            return None
         real = payload.get("real") or {}
         predict = payload.get("predict") or {}
         station = real.get("station") or {}
@@ -340,6 +377,9 @@ def _merge_weather(nmc, cn, city_name):
     temp = t_nmc or t_cn
 
     info = (nmc.get("info") or cn.get("info")) or "--"
+    # NMC 改版后天气描述可能返回占位符 "-"，此时用中国天气网兜底
+    if info in ("--", "-"):
+        info = cn.get("info") or "--"
     wind = (nmc.get("wind") or cn.get("wind")) or "--"
     humidity = hstr(nmc.get("humidity")) if nmc.get("humidity") not in (None, "--") else None
     if not humidity and cn.get("humidity") not in (None, ""):
@@ -388,15 +428,25 @@ class FetchWorker(QThread):
     ok = Signal(dict)
     fail = Signal(str)
 
-    def __init__(self, city_name, index_file, parent=None):
+    def __init__(self, city_name, index_file, auto_location=False, parent=None):
         super().__init__(parent)
         self.city_name = city_name
         self.index_file = index_file
+        self.auto_location = auto_location
 
     def run(self):
         try:
             index = _load_index_cached(self.index_file)
-            result = fetch_weather(self.city_name, index)
+            city = self.city_name
+            if self.auto_location:
+                ip_city = locate_city_by_ip()
+                if not ip_city:
+                    raise ValueError(
+                        "自动定位失败：无法获取当前位置，请检查网络，"
+                        "或在组件设置中关闭自动定位并手动输入城市"
+                    )
+                city = ip_city
+            result = fetch_weather(city, index)
             self.ok.emit(result)
         except Exception as e:
             self.fail.emit(str(e))
@@ -406,6 +456,7 @@ class Plugin(CW2Plugin):
     """天气小组件"""
 
     weatherChanged = Signal()
+    configChanged = Signal()
 
     def __init__(self, api: PluginAPI):
         super().__init__(api)
@@ -422,8 +473,38 @@ class Plugin(CW2Plugin):
         self._alert_title = ""
         self._alert_level = ""
         self._publish_time = ""
+        self._today_hi = ""
+        self._today_hi_date = ""
         self._worker = None
         self._index_file = Path(__file__).resolve().parent / ".station_index.json"
+        self._auto_file = Path(__file__).resolve().parent / ".weather_auto.json"
+        self._auto_location = True
+        self._load_auto_location()
+        logger.debug(f"[weather.debug] __init__ auto={self._auto_location} "
+                     f"file={self._auto_file}")
+
+    def _load_auto_location(self):
+        """读取自动定位开关（旧实例无文件时默认开启）。"""
+        try:
+            if self._auto_file.exists():
+                self._auto_location = bool(
+                    json.loads(self._auto_file.read_text(encoding="utf-8")).get(
+                        "auto_location", True
+                    )
+                )
+        except Exception:
+            pass
+        logger.debug(f"[weather.debug] _load_auto_location -> {self._auto_location}")
+
+    def _save_auto_location(self):
+        try:
+            self._auto_file.write_text(
+                json.dumps({"auto_location": self._auto_location}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.debug(f"[weather.debug] _save_auto_location OK -> {self._auto_location}")
+        except Exception as e:
+            logger.error(f"[weather.debug] _save_auto_location FAILED: {e!r}")
 
     # ---- QML 可读属性 ----
     def _get_status(self):
@@ -475,19 +556,44 @@ class Plugin(CW2Plugin):
     alertLevel = Property(str, _get_alert_level, notify=weatherChanged)
     publishText = Property(str, _get_publish, notify=weatherChanged)
 
+    def _get_auto_location(self):
+        return self._auto_location
+
+    autoLocation = Property(bool, _get_auto_location, notify=weatherChanged)
+
+    @Slot(result=dict)
+    def getConfig(self) -> dict:
+        """返回当前配置（供组件设置页读取初始值）。"""
+        logger.debug(f"[weather.debug] getConfig -> auto_location={self._auto_location}")
+        return {"auto_location": self._auto_location}
+
+    @Slot(bool)
+    def setAutoLocation(self, value: bool) -> None:
+        """切换自动定位并立即按新模式刷新。"""
+        logger.debug(f"[weather.debug] setAutoLocation({value}) current={self._auto_location}")
+        value = bool(value)
+        if value == self._auto_location:
+            return
+        self._auto_location = value
+        self._save_auto_location()
+        self.configChanged.emit()
+        self.refresh("")
+
     @Slot(str)
     def refresh(self, city):
         """按城市名刷新天气与预警（后台线程，不阻塞界面）"""
+        logger.debug(f"[weather.debug] refresh({city!r}) auto={self._auto_location} "
+                     f"busy={self._worker and self._worker.isRunning()}")
         if self._worker and self._worker.isRunning():
             return
         city = (city or "").strip()
-        if not city:
+        if not self._auto_location and not city:
             self._status = "need_city"
             self.weatherChanged.emit()
             return
         self._status = "loading"
         self.weatherChanged.emit()
-        self._worker = FetchWorker(city, self._index_file, self)
+        self._worker = FetchWorker(city, self._index_file, self._auto_location, self)
         self._worker.ok.connect(self._on_ok)
         self._worker.fail.connect(self._on_fail)
         self._worker.start()
@@ -535,6 +641,7 @@ class Plugin(CW2Plugin):
             settings_qml="qml/weather-settings.qml",
             default_settings={
                 "city": "",          # 城市名（如：北京 / 成都）
+                "auto_location": True,   # 自动定位当前位置（IP 定位，免配置）
                 "refresh_interval": 30,  # 自动刷新间隔（分钟）
                 "show_alerts": True,     # 显示气象预警
                 "alert_show_time": 5,    # 预警播报时长（秒），到时自动收起
