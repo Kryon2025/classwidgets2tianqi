@@ -136,6 +136,10 @@ def resolve_city(index, name):
     for e in index:
         if n and n in e["city"]:
             return e
+    # 省名回退：自动定位只返回省名时（如 useragentinfo），取该省第一个城市
+    for e in index:
+        if name in e["province"] or n in _norm(e["province"]):
+            return e
     return None
 
 
@@ -191,8 +195,6 @@ def _get_cn_code(city_name):
             if cn_name == city_name:  # 精确匹配中文名
                 code = cid
                 break
-        if code is None and refs:
-            code = refs[0][0]
         _CN_CODE_CACHE[city_name] = code
         return code
     except Exception as e:
@@ -437,6 +439,8 @@ class FetchWorker(QThread):
     def run(self):
         try:
             index = _load_index_cached(self.index_file)
+            if self.isInterruptionRequested():
+                return
             city = self.city_name
             if self.auto_location:
                 ip_city = locate_city_by_ip()
@@ -477,34 +481,8 @@ class Plugin(CW2Plugin):
         self._today_hi_date = ""
         self._worker = None
         self._index_file = Path(__file__).resolve().parent / ".station_index.json"
-        self._auto_file = Path(__file__).resolve().parent / ".weather_auto.json"
+        # 自动定位开关统一走主程序 settings（组件加载时由 QML 同步），不单独持久化
         self._auto_location = True
-        self._load_auto_location()
-        logger.debug(f"[weather.debug] __init__ auto={self._auto_location} "
-                     f"file={self._auto_file}")
-
-    def _load_auto_location(self):
-        """读取自动定位开关（旧实例无文件时默认开启）。"""
-        try:
-            if self._auto_file.exists():
-                self._auto_location = bool(
-                    json.loads(self._auto_file.read_text(encoding="utf-8")).get(
-                        "auto_location", True
-                    )
-                )
-        except Exception:
-            pass
-        logger.debug(f"[weather.debug] _load_auto_location -> {self._auto_location}")
-
-    def _save_auto_location(self):
-        try:
-            self._auto_file.write_text(
-                json.dumps({"auto_location": self._auto_location}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            logger.debug(f"[weather.debug] _save_auto_location OK -> {self._auto_location}")
-        except Exception as e:
-            logger.error(f"[weather.debug] _save_auto_location FAILED: {e!r}")
 
     # ---- QML 可读属性 ----
     def _get_status(self):
@@ -561,21 +539,13 @@ class Plugin(CW2Plugin):
 
     autoLocation = Property(bool, _get_auto_location, notify=weatherChanged)
 
-    @Slot(result=dict)
-    def getConfig(self) -> dict:
-        """返回当前配置（供组件设置页读取初始值）。"""
-        logger.debug(f"[weather.debug] getConfig -> auto_location={self._auto_location}")
-        return {"auto_location": self._auto_location}
-
     @Slot(bool)
     def setAutoLocation(self, value: bool) -> None:
-        """切换自动定位并立即按新模式刷新。"""
-        logger.debug(f"[weather.debug] setAutoLocation({value}) current={self._auto_location}")
+        """切换自动定位并立即按新模式刷新（开关值由组件设置持久化）。"""
         value = bool(value)
         if value == self._auto_location:
             return
         self._auto_location = value
-        self._save_auto_location()
         self.configChanged.emit()
         self.refresh("")
 
@@ -650,7 +620,17 @@ class Plugin(CW2Plugin):
         print("[weather] 插件已加载")
 
     def on_unload(self):
-        if self._worker and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(2000)
+        if self._worker:
+            worker = self._worker
+            # 先断开信号，卸载后线程结束也不会再回调已销毁的插件
+            try:
+                worker.ok.disconnect(self._on_ok)
+                worker.fail.disconnect(self._on_fail)
+            except RuntimeError:
+                pass
+            worker.requestInterruption()
+            if worker.isRunning():
+                # 最多等当前请求超时（网络请求最长约 15 秒）；多数情况下线程不在运行
+                worker.wait(15000)
+            self._worker = None
         print("[weather] 插件已卸载")

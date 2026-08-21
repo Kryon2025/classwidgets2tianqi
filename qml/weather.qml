@@ -217,7 +217,7 @@ Widget {
         anchors.centerIn: parent
         width: parent.width - 24
         visible: backend.weatherStatus !== "ok"
-        text: backend.weatherStatus === "need_city" ? qsTr("在插件设置中选择城市") :
+        text: backend.weatherStatus === "need_city" ? qsTr("在小组件设置中选择城市") :
               backend.weatherStatus === "error" ? qsTr("获取天气失败，将自动重试") :
               qsTr("加载中，请稍后...")
         horizontalAlignment: Quick.Text.AlignHCenter

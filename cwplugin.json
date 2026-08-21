@@ -1,7 +1,7 @@
 {
  "id": "com.weather",
  "name": "天气(NMC)",
- "version": "1.1.0",
+ "version": "1.1.1",
  "api_version": "~=0.6.0",
  "entry": "main.py",
  "author": "松峰",
